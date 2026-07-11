@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"text/template"
 
 	"github.com/go-pdf/fpdf"
@@ -278,13 +279,21 @@ func (r *Renderer) fpdfAlign() string {
 }
 
 // loadFont loads the embedded Go Regular font, or the user-supplied TTF when
-// cfg.FontPath is set. fpdf stores errors internally; they surface on Output().
+// cfg.FontPath is set. We always use AddUTF8FontFromBytes to avoid fpdf's
+// broken path handling: it joins paths with "." as the base, which strips
+// leading slashes from absolute paths via filepath.Clean.
 func (r *Renderer) loadFont() error {
+	var data []byte
 	if r.cfg.FontPath != "" {
-		r.pdf.AddUTF8Font(fontFamily, "", r.cfg.FontPath)
+		var err error
+		data, err = os.ReadFile(r.cfg.FontPath)
+		if err != nil {
+			return err
+		}
 	} else {
-		r.pdf.AddUTF8FontFromBytes(fontFamily, "", goregular.TTF)
+		data = goregular.TTF
 	}
+	r.pdf.AddUTF8FontFromBytes(fontFamily, "", data)
 	return r.pdf.Error()
 }
 
