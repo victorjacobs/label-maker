@@ -68,6 +68,9 @@ func (r *Renderer) Render(labels []Label, w io.Writer) error {
 		if slot.Page != currentPage {
 			pdf.AddPage()
 			currentPage = slot.Page
+			if cfg.DrawBorder {
+				r.drawPageGrid(grid)
+			}
 		}
 		r.renderLabel(slot, label.Lines)
 	}
@@ -75,6 +78,9 @@ func (r *Renderer) Render(labels []Label, w io.Writer) error {
 	if currentPage == -1 {
 		// No labels — add a blank page so the PDF is still valid.
 		pdf.AddPage()
+		if cfg.DrawBorder {
+			r.drawPageGrid(grid)
+		}
 	}
 
 	return pdf.Output(w)
@@ -158,16 +164,41 @@ func splitLines(s string) []string {
 	return out
 }
 
+// drawPageGrid draws the label grid for the current page. Called once per page
+// when --draw-border is set.
+//
+// With gap=0 it draws a single grid line at each boundary so adjacent labels
+// don't produce doubled strokes. With a non-zero gap it draws a rectangle for
+// each label slot (showing the gap as blank space between outlines).
+func (r *Renderer) drawPageGrid(grid layout.Grid) {
+	cfg := r.cfg
+	r.pdf.SetLineWidth(0.25)
+
+	if cfg.GapX == 0 && cfg.GapY == 0 {
+		totalW := float64(grid.Cols) * cfg.LabelW
+		totalH := float64(grid.Rows) * cfg.LabelH
+		for col := 0; col <= grid.Cols; col++ {
+			x := cfg.MarginLeft + float64(col)*cfg.LabelW
+			r.pdf.Line(x, cfg.MarginTop, x, cfg.MarginTop+totalH)
+		}
+		for row := 0; row <= grid.Rows; row++ {
+			y := cfg.MarginTop + float64(row)*cfg.LabelH
+			r.pdf.Line(cfg.MarginLeft, y, cfg.MarginLeft+totalW, y)
+		}
+	} else {
+		for i := 0; i < grid.LabelsPerPage(); i++ {
+			s := grid.Slot(i)
+			r.pdf.Rect(s.X, s.Y, cfg.LabelW, cfg.LabelH, "D")
+		}
+	}
+}
+
 // renderLabel draws a single label at the given slot position.
 func (r *Renderer) renderLabel(slot layout.Slot, lines []string) {
 	cfg := r.cfg
 	x, y := slot.X, slot.Y
 	w, h := cfg.LabelW, cfg.LabelH
 	pad := cfg.Padding
-
-	if cfg.DrawBorder {
-		r.pdf.Rect(x, y, w, h, "D")
-	}
 
 	if len(lines) == 0 {
 		return
