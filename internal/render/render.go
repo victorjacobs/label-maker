@@ -1,0 +1,322 @@
+package render
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"text/template"
+
+	"github.com/go-pdf/fpdf"
+	"github.com/victorjacobs/label-maker/internal/config"
+	"github.com/victorjacobs/label-maker/internal/layout"
+	"golang.org/x/image/font/gofont/goregular"
+)
+
+const (
+	fontFamily  = "goregular"
+	maxFontSize = 12.0
+	minFontSize = 5.0
+	// 1 pt = 25.4/72 mm; multiply by line spacing factor 1.3
+	ptToMmFactor = (25.4 / 72.0) * 1.3
+)
+
+// Label is a single rendered label: the lines of text to draw.
+type Label struct {
+	Lines []string
+}
+
+// Renderer builds the PDF.
+type Renderer struct {
+	cfg *config.Config
+	pdf *fpdf.Fpdf
+}
+
+// New creates a Renderer. Call Render to produce the PDF.
+func New(cfg *config.Config) *Renderer {
+	return &Renderer{cfg: cfg}
+}
+
+// Render processes records and writes a PDF to w.
+func (r *Renderer) Render(labels []Label, w io.Writer) error {
+	cfg := r.cfg
+
+	pdf := fpdf.NewCustom(&fpdf.InitType{
+		UnitStr: "mm",
+		Size:    fpdf.SizeType{Wd: cfg.PageW, Ht: cfg.PageH},
+	})
+	pdf.SetMargins(0, 0, 0)
+	pdf.SetAutoPageBreak(false, 0)
+	r.pdf = pdf
+
+	if err := r.loadFont(); err != nil {
+		return fmt.Errorf("loading font: %w", err)
+	}
+	pdf.SetFont(fontFamily, "", maxFontSize)
+
+	grid := layout.NewGrid(layout.Config{
+		PageW: cfg.PageW, PageH: cfg.PageH,
+		LabelW: cfg.LabelW, LabelH: cfg.LabelH,
+		MarginTop: cfg.MarginTop, MarginLeft: cfg.MarginLeft,
+		GapX: cfg.GapX, GapY: cfg.GapY,
+		Columns: cfg.Columns, Rows: cfg.Rows,
+	})
+
+	currentPage := -1
+
+	for i, label := range labels {
+		slot := grid.Slot(i + cfg.Skip)
+		if slot.Page != currentPage {
+			pdf.AddPage()
+			currentPage = slot.Page
+		}
+		r.renderLabel(slot, label.Lines)
+	}
+
+	if currentPage == -1 {
+		// No labels — add a blank page so the PDF is still valid.
+		pdf.AddPage()
+	}
+
+	return pdf.Output(w)
+}
+
+// BuildLabels expands CSV records into a flat list of labels, applying the
+// template, copies column, and default copies count.
+func BuildLabels(records []map[string]string, headers []string, cfg *config.Config) ([]Label, error) {
+	tmpl, err := buildTemplate(cfg.Template, headers)
+	if err != nil {
+		return nil, fmt.Errorf("parsing template: %w", err)
+	}
+
+	var labels []Label
+	for _, rec := range records {
+		lines, err := executeTemplate(tmpl, rec, headers, cfg.Template == "")
+		if err != nil {
+			return nil, fmt.Errorf("executing template: %w", err)
+		}
+
+		copies := cfg.Copies
+		if cfg.CopiesColumn != "" {
+			if n, err := parseCopies(rec[cfg.CopiesColumn]); err == nil && n > 0 {
+				copies = n
+			}
+		}
+
+		lbl := Label{Lines: lines}
+		for range copies {
+			labels = append(labels, lbl)
+		}
+	}
+	return labels, nil
+}
+
+// buildTemplate parses and returns the label text/template. When tmplStr is
+// empty (default template), it returns nil to signal "use default".
+func buildTemplate(tmplStr string, headers []string) (*template.Template, error) {
+	if tmplStr == "" {
+		return nil, nil
+	}
+	// Interpret literal \n as newline (shell doesn't expand \n in --template flags).
+	expanded := expandEscapes(tmplStr)
+	return template.New("label").Parse(expanded)
+}
+
+// executeTemplate renders a record into label lines.
+// When tmpl is nil the default template (all non-empty columns joined) is used.
+func executeTemplate(tmpl *template.Template, rec map[string]string, headers []string, useDefault bool) ([]string, error) {
+	var text string
+	if useDefault {
+		buf := &bytes.Buffer{}
+		for _, h := range headers {
+			if v := rec[h]; v != "" {
+				if buf.Len() > 0 {
+					buf.WriteByte('\n')
+				}
+				buf.WriteString(v)
+			}
+		}
+		text = buf.String()
+	} else {
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, rec); err != nil {
+			return nil, err
+		}
+		text = buf.String()
+	}
+
+	return splitLines(text), nil
+}
+
+func splitLines(s string) []string {
+	var out []string
+	for _, line := range splitNewlines(s) {
+		trimmed := trimWhitespace(line)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// renderLabel draws a single label at the given slot position.
+func (r *Renderer) renderLabel(slot layout.Slot, lines []string) {
+	cfg := r.cfg
+	x, y := slot.X, slot.Y
+	w, h := cfg.LabelW, cfg.LabelH
+	pad := cfg.Padding
+
+	if cfg.DrawBorder {
+		r.pdf.Rect(x, y, w, h, "D")
+	}
+
+	if len(lines) == 0 {
+		return
+	}
+
+	innerW := w - 2*pad
+	innerH := h - 2*pad
+
+	fontSize := cfg.FontSize
+	if fontSize == 0 {
+		fontSize = r.autoFitFontSize(lines, innerW)
+	}
+	r.pdf.SetFontSize(fontSize)
+
+	lineH := fontSize * ptToMmFactor
+	totalH := float64(len(lines)) * lineH
+
+	var startY float64
+	switch cfg.VAlign {
+	case "top":
+		startY = y + pad
+	case "bottom":
+		offset := innerH - totalH
+		if offset < 0 {
+			offset = 0
+		}
+		startY = y + pad + offset
+	default: // middle
+		offset := (innerH - totalH) / 2
+		if offset < 0 {
+			offset = 0
+		}
+		startY = y + pad + offset
+	}
+
+	alignStr := r.fpdfAlign()
+	maxY := y + h - pad
+
+	for _, line := range lines {
+		if startY+lineH > maxY+lineH/2 { // stop before clipping outside the label
+			break
+		}
+		r.pdf.SetXY(x+pad, startY)
+		r.pdf.CellFormat(innerW, lineH, line, "", 0, alignStr, false, 0, "")
+		startY += lineH
+	}
+}
+
+// autoFitFontSize returns the largest font size (down to minFontSize) at which
+// every line fits within maxWidth mm.
+func (r *Renderer) autoFitFontSize(lines []string, maxWidth float64) float64 {
+	for size := maxFontSize; size >= minFontSize; size -= 0.5 {
+		r.pdf.SetFontSize(size)
+		fits := true
+		for _, line := range lines {
+			if r.pdf.GetStringWidth(line) > maxWidth {
+				fits = false
+				break
+			}
+		}
+		if fits {
+			return size
+		}
+	}
+	return minFontSize
+}
+
+func (r *Renderer) fpdfAlign() string {
+	switch r.cfg.Align {
+	case "center":
+		return "C"
+	case "right":
+		return "R"
+	default:
+		return "L"
+	}
+}
+
+// loadFont loads the embedded Go Regular font, or the user-supplied TTF when
+// cfg.FontPath is set.
+func (r *Renderer) loadFont() error {
+	if r.cfg.FontPath != "" {
+		return r.pdf.AddUTF8Font(fontFamily, "", r.cfg.FontPath)
+	}
+	return loadFontFromBytes(r.pdf, fontFamily, "", goregular.TTF)
+}
+
+// loadFontFromBytes writes font bytes to a temp file (fpdf requires a file path)
+// and registers it. The temp file is removed once fpdf has read it.
+func loadFontFromBytes(pdf *fpdf.Fpdf, family, style string, data []byte) error {
+	tmp, err := os.CreateTemp("", "label-maker-font-*.ttf")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	path := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(path)
+		return fmt.Errorf("writing font: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("closing font file: %w", err)
+	}
+	defer os.Remove(path)
+	return pdf.AddUTF8Font(family, style, path)
+}
+
+func parseCopies(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
+}
+
+// expandEscapes converts literal \n sequences to newlines in template strings.
+func expandEscapes(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == 'n' {
+			out = append(out, '\n')
+			i++
+		} else {
+			out = append(out, s[i])
+		}
+	}
+	return string(out)
+}
+
+func splitNewlines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	lines = append(lines, s[start:])
+	return lines
+}
+
+func trimWhitespace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
