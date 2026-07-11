@@ -23,18 +23,16 @@
         };
 
         # ── Buildable package ──────────────────────────────────────────────
-        # vendor/ is committed, so vendorHash = null tells buildGoModule to use it.
-        # After adding new dependencies:
-        #   nix develop --command go mod tidy
-        #   nix develop --command go mod vendor
-        #   git add vendor
+        # To update after changing dependencies:
+        #   1. Set vendorHash = pkgs.lib.fakeHash;
+        #   2. Run `nix build` — it fails printing the correct sha256.
+        #   3. Replace with that sha256.
         packages.default = pkgs.buildGoModule {
           pname = "label-maker";
           version = "0.1.0";
           src = ./.;
 
-          # vendor/ is checked in, so Nix uses it directly.
-          vendorHash = null;
+          vendorHash = "sha256-beRCLMXSJdb2N3UySsa/tTiuf+7MtBYmgVvCt3bT5bk=";
 
           meta = with pkgs.lib; {
             description = "Turn a CSV of addresses into a print-ready PDF of labels";

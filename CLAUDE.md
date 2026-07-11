@@ -22,10 +22,10 @@ After changing dependencies:
 ```sh
 nix develop --command go get <pkg>
 nix develop --command go mod tidy
-nix develop --command go mod vendor
-git add vendor go.mod go.sum
+git add go.mod go.sum
 ```
-`vendor/` is committed, so `vendorHash = null` in `flake.nix`.
+Then update `vendorHash` in `flake.nix`: set it to `pkgs.lib.fakeHash`, run
+`nix build`, copy the printed sha256, paste it in.
 
 ---
 
