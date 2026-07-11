@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"text/template"
 
 	"github.com/go-pdf/fpdf"
@@ -248,33 +247,14 @@ func (r *Renderer) fpdfAlign() string {
 }
 
 // loadFont loads the embedded Go Regular font, or the user-supplied TTF when
-// cfg.FontPath is set.
+// cfg.FontPath is set. fpdf stores errors internally; they surface on Output().
 func (r *Renderer) loadFont() error {
 	if r.cfg.FontPath != "" {
-		return r.pdf.AddUTF8Font(fontFamily, "", r.cfg.FontPath)
+		r.pdf.AddUTF8Font(fontFamily, "", r.cfg.FontPath)
+	} else {
+		r.pdf.AddUTF8FontFromBytes(fontFamily, "", goregular.TTF)
 	}
-	return loadFontFromBytes(r.pdf, fontFamily, "", goregular.TTF)
-}
-
-// loadFontFromBytes writes font bytes to a temp file (fpdf requires a file path)
-// and registers it. The temp file is removed once fpdf has read it.
-func loadFontFromBytes(pdf *fpdf.Fpdf, family, style string, data []byte) error {
-	tmp, err := os.CreateTemp("", "label-maker-font-*.ttf")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	path := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(path)
-		return fmt.Errorf("writing font: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(path)
-		return fmt.Errorf("closing font file: %w", err)
-	}
-	defer os.Remove(path)
-	return pdf.AddUTF8Font(family, style, path)
+	return r.pdf.Error()
 }
 
 func parseCopies(s string) (int, error) {
